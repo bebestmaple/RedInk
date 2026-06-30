@@ -8,7 +8,7 @@ FROM node:22-slim AS frontend-builder
 WORKDIR /app/frontend
 
 # 安装 pnpm
-RUN npm install -g pnpm
+RUN npm install -g pnpm@10.19.0
 
 # 复制前端依赖文件
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
