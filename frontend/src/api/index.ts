@@ -1,6 +1,38 @@
 import axios from 'axios'
+import type { AppError } from '../utils/errors'
 
 const API_BASE_URL = '/api'
+
+function getApiErrorPayload(error: unknown, fallback: string): {
+  error: AppError | string
+  error_message: string
+} {
+  if (axios.isAxiosError(error)) {
+    if (error.code === 'ECONNABORTED') {
+      return {
+        error: '请求超时，请检查网络连接',
+        error_message: '请求超时，请检查网络连接'
+      }
+    }
+    if (!error.response) {
+      return {
+        error: '网络连接失败，请检查网络设置',
+        error_message: '网络连接失败，请检查网络设置'
+      }
+    }
+    const data = error.response.data || {}
+    const message = data.error_message || fallback
+    return {
+      error: data.error || message,
+      error_message: message
+    }
+  }
+
+  return {
+    error: fallback,
+    error_message: fallback
+  }
+}
 
 export interface Page {
   index: number
@@ -12,7 +44,8 @@ export interface OutlineResponse {
   success: boolean
   outline?: string
   pages?: Page[]
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }
 
 export interface ProgressEvent {
@@ -22,12 +55,19 @@ export interface ProgressEvent {
   total?: number
   image_url?: string
   message?: string
+  error?: AppError | string
+  retryable?: boolean
 }
 
 export interface FinishEvent {
   success: boolean
   task_id: string
   images: string[]
+  total?: number
+  completed?: number
+  failed?: number
+  failed_indices?: number[]
+  cached?: boolean
 }
 
 // 生成大纲（支持图片上传）
@@ -77,14 +117,16 @@ export async function regenerateImage(
   context?: {
     fullOutline?: string
     userTopic?: string
+    recordId?: string | null
   }
-): Promise<{ success: boolean; index: number; image_url?: string; error?: string }> {
+): Promise<{ success: boolean; index: number; image_url?: string; error?: AppError | string; error_message?: string }> {
   const response = await axios.post(`${API_BASE_URL}/regenerate`, {
     task_id: taskId,
     page,
     use_reference: useReference,
     full_outline: context?.fullOutline,
-    user_topic: context?.userTopic
+    user_topic: context?.userTopic,
+    record_id: context?.recordId || undefined
   })
   return response.data
 }
@@ -97,7 +139,8 @@ export async function retryFailedImages(
   onComplete: (event: ProgressEvent) => void,
   onError: (event: ProgressEvent) => void,
   onFinish: (event: { success: boolean; total: number; completed: number; failed: number }) => void,
-  onStreamError: (error: Error) => void
+  onStreamError: (error: unknown) => void,
+  recordId?: string | null
 ) {
   try {
     const response = await fetch(`${API_BASE_URL}/retry-failed`, {
@@ -107,12 +150,13 @@ export async function retryFailedImages(
       },
       body: JSON.stringify({
         task_id: taskId,
-        pages
+        pages,
+        record_id: recordId || undefined
       })
     })
 
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`)
+      throw await readErrorResponse(response, `请求失败：HTTP ${response.status}`)
     }
 
     const reader = response.body?.getReader()
@@ -168,7 +212,7 @@ export async function retryFailedImages(
       reader.releaseLock()
     }
   } catch (error) {
-    onStreamError(error as Error)
+    onStreamError(error)
   }
 }
 
@@ -264,7 +308,7 @@ export async function createHistory(
   topic: string,
   outline: { raw: string; pages: Page[] },
   taskId?: string
-): Promise<{ success: boolean; record_id?: string; error?: string }> {
+): Promise<{ success: boolean; record_id?: string; error?: AppError | string; error_message?: string }> {
   try {
     const response = await axios.post(
       `${API_BASE_URL}/history`,
@@ -279,17 +323,7 @@ export async function createHistory(
     )
     return response.data
   } catch (error: any) {
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        return { success: false, error: '请求超时，请检查网络连接' }
-      }
-      if (!error.response) {
-        return { success: false, error: '网络连接失败，请检查网络设置' }
-      }
-      const errorMessage = error.response?.data?.error || error.message || '创建历史记录失败'
-      return { success: false, error: errorMessage }
-    }
-    return { success: false, error: '未知错误，请稍后重试' }
+    return { success: false, ...getApiErrorPayload(error, '创建历史记录失败') }
   }
 }
 
@@ -315,7 +349,8 @@ export async function getHistoryList(
   page: number
   page_size: number
   total_pages: number
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   try {
     const params: any = { page, page_size: pageSize }
@@ -327,40 +362,6 @@ export async function getHistoryList(
     })
     return response.data
   } catch (error: any) {
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        return {
-          success: false,
-          records: [],
-          total: 0,
-          page: 1,
-          page_size: pageSize,
-          total_pages: 0,
-          error: '请求超时，请检查网络连接'
-        }
-      }
-      if (!error.response) {
-        return {
-          success: false,
-          records: [],
-          total: 0,
-          page: 1,
-          page_size: pageSize,
-          total_pages: 0,
-          error: '网络连接失败，请检查网络设置'
-        }
-      }
-      const errorMessage = error.response?.data?.error || error.message || '获取历史记录列表失败'
-      return {
-        success: false,
-        records: [],
-        total: 0,
-        page: 1,
-        page_size: pageSize,
-        total_pages: 0,
-        error: errorMessage
-      }
-    }
     return {
       success: false,
       records: [],
@@ -368,7 +369,7 @@ export async function getHistoryList(
       page: 1,
       page_size: pageSize,
       total_pages: 0,
-      error: '未知错误，请稍后重试'
+      ...getApiErrorPayload(error, '获取历史记录列表失败')
     }
   }
 }
@@ -385,7 +386,8 @@ export async function getHistoryList(
 export async function getHistory(recordId: string): Promise<{
   success: boolean
   record?: HistoryDetail
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   try {
     const response = await axios.get(`${API_BASE_URL}/history/${recordId}`, {
@@ -393,20 +395,7 @@ export async function getHistory(recordId: string): Promise<{
     })
     return response.data
   } catch (error: any) {
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        return { success: false, error: '请求超时，请检查网络连接' }
-      }
-      if (!error.response) {
-        return { success: false, error: '网络连接失败，请检查网络设置' }
-      }
-      if (error.response.status === 404) {
-        return { success: false, error: '历史记录不存在' }
-      }
-      const errorMessage = error.response?.data?.error || error.message || '获取历史记录详情失败'
-      return { success: false, error: errorMessage }
-    }
-    return { success: false, error: '未知错误，请稍后重试' }
+    return { success: false, ...getApiErrorPayload(error, '获取历史记录详情失败') }
   }
 }
 
@@ -448,7 +437,7 @@ export async function getHistory(recordId: string): Promise<{
 export async function updateHistory(
   recordId: string,
   data: UpdateHistoryParams
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: AppError | string; error_message?: string }> {
   try {
     const response = await axios.put(
       `${API_BASE_URL}/history/${recordId}`,
@@ -459,17 +448,7 @@ export async function updateHistory(
     )
     return response.data
   } catch (error: any) {
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        return { success: false, error: '请求超时，请检查网络连接' }
-      }
-      if (!error.response) {
-        return { success: false, error: '网络连接失败，请检查网络设置' }
-      }
-      const errorMessage = error.response?.data?.error || error.message || '更新历史记录失败'
-      return { success: false, error: errorMessage }
-    }
-    return { success: false, error: '未知错误，请稍后重试' }
+    return { success: false, ...getApiErrorPayload(error, '更新历史记录失败') }
   }
 }
 
@@ -521,7 +500,8 @@ export async function checkHistoryExists(recordId: string): Promise<boolean> {
 // 删除历史记录
 export async function deleteHistory(recordId: string): Promise<{
   success: boolean
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   try {
     const response = await axios.delete(
@@ -532,17 +512,7 @@ export async function deleteHistory(recordId: string): Promise<{
     )
     return response.data
   } catch (error: any) {
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        return { success: false, error: '请求超时，请检查网络连接' }
-      }
-      if (!error.response) {
-        return { success: false, error: '网络连接失败，请检查网络设置' }
-      }
-      const errorMessage = error.response?.data?.error || error.message || '删除历史记录失败'
-      return { success: false, error: errorMessage }
-    }
-    return { success: false, error: '未知错误，请稍后重试' }
+    return { success: false, ...getApiErrorPayload(error, '删除历史记录失败') }
   }
 }
 
@@ -558,7 +528,8 @@ export async function deleteHistory(recordId: string): Promise<{
 export async function searchHistory(keyword: string): Promise<{
   success: boolean
   records: HistoryRecord[]
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   try {
     const response = await axios.get(`${API_BASE_URL}/history/search`, {
@@ -567,17 +538,7 @@ export async function searchHistory(keyword: string): Promise<{
     })
     return response.data
   } catch (error: any) {
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        return { success: false, records: [], error: '请求超时，请检查网络连接' }
-      }
-      if (!error.response) {
-        return { success: false, records: [], error: '网络连接失败，请检查网络设置' }
-      }
-      const errorMessage = error.response?.data?.error || error.message || '搜索历史记录失败'
-      return { success: false, records: [], error: errorMessage }
-    }
-    return { success: false, records: [], error: '未知错误，请稍后重试' }
+    return { success: false, records: [], ...getApiErrorPayload(error, '搜索历史记录失败') }
   }
 }
 
@@ -592,7 +553,8 @@ export async function getHistoryStats(): Promise<{
   success: boolean
   total: number
   by_status: Record<string, number>
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   try {
     const response = await axios.get(`${API_BASE_URL}/history/stats`, {
@@ -600,17 +562,7 @@ export async function getHistoryStats(): Promise<{
     })
     return response.data
   } catch (error: any) {
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        return { success: false, total: 0, by_status: {}, error: '请求超时，请检查网络连接' }
-      }
-      if (!error.response) {
-        return { success: false, total: 0, by_status: {}, error: '网络连接失败，请检查网络设置' }
-      }
-      const errorMessage = error.response?.data?.error || error.message || '获取统计信息失败'
-      return { success: false, total: 0, by_status: {}, error: errorMessage }
-    }
-    return { success: false, total: 0, by_status: {}, error: '未知错误，请稍后重试' }
+    return { success: false, total: 0, by_status: {}, ...getApiErrorPayload(error, '获取统计信息失败') }
   }
 }
 
@@ -623,9 +575,11 @@ export async function generateImagesPost(
   onComplete: (event: ProgressEvent) => void,
   onError: (event: ProgressEvent) => void,
   onFinish: (event: FinishEvent) => void,
-  onStreamError: (error: Error) => void,
+  onStreamError: (error: unknown) => void,
   userImages?: File[],
-  userTopic?: string
+  userTopic?: string,
+  recordId?: string | null,
+  force: boolean = false
 ) {
   try {
     // 将用户图片转换为 base64
@@ -653,12 +607,14 @@ export async function generateImagesPost(
         task_id: taskId,
         full_outline: fullOutline,
         user_images: userImagesBase64.length > 0 ? userImagesBase64 : undefined,
-        user_topic: userTopic || ''
+        user_topic: userTopic || '',
+        record_id: recordId || undefined,
+        force
       })
     })
 
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`)
+      throw await readErrorResponse(response, `请求失败：HTTP ${response.status}`)
     }
 
     const reader = response.body?.getReader()
@@ -714,7 +670,7 @@ export async function generateImagesPost(
       reader.releaseLock()
     }
   } catch (error) {
-    onStreamError(error as Error)
+    onStreamError(error)
   }
 }
 
@@ -726,7 +682,8 @@ export async function scanAllTasks(): Promise<{
   failed?: number
   orphan_tasks?: string[]
   results?: any[]
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   const response = await axios.post(`${API_BASE_URL}/history/scan-all`)
   return response.data
@@ -749,7 +706,8 @@ export interface Config {
 export async function getConfig(): Promise<{
   success: boolean
   config?: Config
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   const response = await axios.get(`${API_BASE_URL}/config`)
   return response.data
@@ -759,7 +717,8 @@ export async function getConfig(): Promise<{
 export async function updateConfig(config: Partial<Config>): Promise<{
   success: boolean
   message?: string
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   const response = await axios.post(`${API_BASE_URL}/config`, config)
   return response.data
@@ -771,11 +730,13 @@ export async function testConnection(config: {
   provider_name?: string
   api_key?: string
   base_url?: string
+  endpoint_type?: string
   model: string
 }): Promise<{
   success: boolean
   message?: string
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }> {
   const response = await axios.post(`${API_BASE_URL}/config/test`, config)
   return response.data
@@ -788,7 +749,8 @@ export interface ContentResponse {
   titles?: string[]
   copywriting?: string
   tags?: string[]
-  error?: string
+  error?: AppError | string
+  error_message?: string
 }
 
 // 生成标题、文案、标签
@@ -801,4 +763,12 @@ export async function generateContent(
     outline
   })
   return response.data
+}
+
+async function readErrorResponse(response: Response, fallback: string) {
+  try {
+    return await response.json()
+  } catch {
+    return new Error(fallback)
+  }
 }
